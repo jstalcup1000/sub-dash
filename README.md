@@ -8,7 +8,7 @@ Open `index.html` in a browser (no install or build step needed).
 
 | Control | Action |
 |---|---|
-| Hold **Space** / **↑** / **W** / tap | Blow ballast and rise |
+| Hold **Space** / **↑** / **W** / tap anywhere | Blow ballast and rise |
 | Release | Sink |
 | **↓** / **S** | Dive faster |
 | **P** | Pause |
