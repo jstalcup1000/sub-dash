@@ -19,6 +19,10 @@
     padding: 6px 14px; font: inherit; cursor: pointer; }
   .levels button.active { background: #ffc300; color: #061a2b; border-color: #ffc300; font-weight: bold; }
   .levels.locked { opacity: .45; pointer-events: none; } /* can't change difficulty mid-run */
+  #pearlBtn { background: #123a55; color: #cfe9ff; border: 1px solid #7fd8ff; border-radius: 999px;
+    padding: 8px 20px; font: inherit; font-weight: bold; cursor: pointer; box-shadow: 0 0 12px #7fd8ff66; }
+  #pearlBtn:disabled { opacity: .4; box-shadow: none; border-color: #1f5b82; cursor: default; }
+  #pearlBtn.active { background: #fff3c4; color: #061a2b; border-color: #fff3c4; opacity: 1; }
   .help { margin: 0; font-size: .9rem; opacity: .75; text-align: center; padding: 0 12px; }
   kbd { background: #123a55; border-radius: 4px; padding: 1px 6px; font-family: inherit; }
   /* show keyboard help on computers, touch help on phones/tablets */
@@ -32,6 +36,7 @@
 <body>
 <h1>SUB DASH</h1>
 <canvas id="game"></canvas>
+<button type="button" id="pearlBtn" disabled>Use pearl (0)</button>
 <div class="levels" id="levels">
   <span>Difficulty:</span>
   <button type="button" data-level="easy">Easy</button>
@@ -40,11 +45,11 @@
 </div>
 <p class="help help-keys">
   Hold <kbd>Space</kbd> / <kbd>↑</kbd> / click to blow ballast and rise &middot; release to sink &middot;
-  <kbd>↓</kbd> dive &middot; <kbd>P</kbd> pause &middot; <kbd>M</kbd> mute
+  <kbd>↓</kbd> dive &middot; <kbd>E</kbd> use a pearl &middot; <kbd>P</kbd> pause &middot; <kbd>M</kbd> mute
 </p>
 <p class="help help-touch">
   Hold the <b>top half</b> of the screen to rise &middot; hold the <b>bottom half</b> to dive &middot;
-  let go to sink
+  let go to sink &middot; tap <b>Use pearl</b> for a shield
 </p>
 
 <script>
@@ -74,6 +79,8 @@
   };
   const RISE = 1100, SINK = 520, DIVE = 950;             // vertical accel, px/s^2
   const DRAG = 2.2, MAX_VY = 340;
+  // Pearls: collect them, then spend one for a few seconds of invincibility (like a star in Mario)
+  const PEARL_CHANCE = 0.2, MAX_PEARLS = 3, SHIELD_TIME = 3, PEARL_R = 9;
 
   // ---------- Helpers ----------
   const rand = (a, b) => a + Math.random() * (b - a);
@@ -93,8 +100,9 @@
   const bestKey = () => level === 'normal' ? 'subdash-best' : `subdash-best-${level}`;
   let best = +localStorage.getItem(bestKey()) || 0;
   let speed = START_SPEED, distance = 0, score = 0, lastMilestone = 0;
-  let obstacles = [], particles = [];
+  let obstacles = [], particles = [], pickups = [];
   let nextSpawn = 0, time = 0, overAt = 0, flash = 0, shake = 0, bgOffset = 0;
+  let pearls = 0, shield = 0, nextPearl = Infinity;   // pearls held, shield seconds left, distance of next pearl
   const player = { x: 170, y: H / 2, vy: 0, angle: 0, prop: 0, bubbleTimer: 0 };
   const input = { up: false, down: false };   // combined keyboard + touch state, see Input below
   const IS_TOUCH = window.matchMedia('(pointer: coarse)').matches;
@@ -142,6 +150,9 @@
     },
     ping() { this.tone(1400, 1300, 0.5, 'sine', 0.1); this.tone(1400, 1300, 0.4, 'sine', 0.035, 0.3); },
     start() { this.tone(300, 600, 0.25, 'triangle', 0.1); },
+    pearl() { this.tone(1200, 1800, 0.12, 'sine', 0.09); this.tone(1800, 2400, 0.15, 'sine', 0.06, 0.08); },
+    shield() { [523, 659, 784, 1047].forEach((f, i) => this.tone(f, f, 0.14, 'square', 0.05, i * 0.07)); },
+    smash() { this.tone(500, 120, 0.25, 'square', 0.08); },
     crash() {
       if (muted || !this.ac) return;
       const c = this.ac, len = c.sampleRate * 0.8;
@@ -238,21 +249,37 @@
     const nx = clamp(cx, rx, rx + rw), ny = clamp(cy, ry, ry + rh);
     return (cx - nx) ** 2 + (cy - ny) ** 2 < r * r;
   }
-  function collides() {
-    const pcs = playerCircles();
-    for (const o of obstacles) {
-      if (o.x > player.x + 60 || o.x + o.w < player.x - 60) continue;
-      for (const s of hitShapes(o)) {
-        for (const [px, py, pr] of pcs) {
-          if (s.rect && circleHitsRect(px, py, pr, ...s.rect)) return true;
-          if (s.circle) {
-            const [cx, cy, cr] = s.circle;
-            if ((px - cx) ** 2 + (py - cy) ** 2 < (pr + cr) ** 2) return true;
-          }
-        }
+  function circleHitsObstacle(px, py, pr, o) {
+    for (const s of hitShapes(o)) {
+      if (s.rect && circleHitsRect(px, py, pr, ...s.rect)) return true;
+      if (s.circle) {
+        const [cx, cy, cr] = s.circle;
+        if ((px - cx) ** 2 + (py - cy) ** 2 < (pr + cr) ** 2) return true;
       }
     }
     return false;
+  }
+  // every obstacle currently touching the sub
+  function hits() {
+    const pcs = playerCircles();
+    return obstacles.filter(o => !(o.x > player.x + 60 || o.x + o.w < player.x - 60) &&
+      pcs.some(([px, py, pr]) => circleHitsObstacle(px, py, pr, o)));
+  }
+
+  // A pearl floats in open water, placed so it isn't inside a rock/iceberg/mine near where it appears
+  function spawnPearl() {
+    const x = W + 40;
+    const near = obstacles.filter(o => o.x < x + 120 && o.x + o.w > x - 120);
+    for (let tries = 0; tries < 8; tries++) {
+      const y = rand(SURFACE + 40, SEABED - 40);
+      if (!near.some(o => circleHitsObstacle(x, y, PEARL_R + 30, o))) {
+        pickups.push({ x, y, baseY: y, t: rand(0, 6) });
+        return;
+      }
+    }
+  }
+  function pearlTouchesSub(p) {
+    return playerCircles().some(([px, py, pr]) => (px - p.x) ** 2 + (py - p.y) ** 2 < (pr + PEARL_R + 4) ** 2);
   }
 
   // ---------- Particles ----------
@@ -268,7 +295,8 @@
   // ---------- Game flow ----------
   function startGame() {
     speed = START_SPEED; distance = 0; score = 0; lastMilestone = 0; flash = 0;
-    obstacles = []; particles = [];
+    obstacles = []; particles = []; pickups = [];
+    pearls = 0; shield = 0; nextPearl = Infinity;
     nextSpawn = 500;
     player.y = H / 2; player.vy = 0; player.angle = 0;
     state = 'playing';
@@ -277,7 +305,16 @@
     sfx.start();
   }
 
+  function usePearl() {
+    if (state !== 'playing' || paused || pearls <= 0 || shield > 0) return;
+    pearls--;
+    shield = SHIELD_TIME;
+    for (let i = 0; i < 16; i++) spark(player.x, player.y);
+    sfx.shield();
+  }
+
   function crash() {
+    shield = 0;
     state = 'over';
     overAt = time;
     updateLevelUI();
@@ -340,7 +377,12 @@
         spawnObstacle();
         const tMin = lerp(1.6, 1.05, difficulty());
         nextSpawn = distance + speed * rand(tMin, tMin + 0.9);
+        // sometimes drop a pearl halfway to the next obstacle, where the water is clear
+        if (nextPearl === Infinity && pearls + pickups.length < MAX_PEARLS && Math.random() < PEARL_CHANCE) {
+          nextPearl = (distance + nextSpawn) / 2;
+        }
       }
+      if (distance >= nextPearl) { spawnPearl(); nextPearl = Infinity; }
 
       for (const o of obstacles) {
         o.x -= (speed + (o.extra || 0)) * dt;
@@ -349,7 +391,34 @@
       }
       obstacles = obstacles.filter(o => o.x + o.w > -60);
 
-      if (collides()) crash();
+      for (const p of pickups) {
+        p.x -= speed * dt;
+        p.t += dt;
+        p.y = p.baseY + Math.sin(p.t * 2.5) * 6;
+        if (!p.taken && pearlTouchesSub(p)) {
+          p.taken = true;
+          pearls = Math.min(MAX_PEARLS, pearls + 1);
+          for (let i = 0; i < 10; i++) bubble(p.x, p.y, rand(-80, 80), rand(-120, 20), rand(1, 3), rand(0.4, 0.8));
+          sfx.pearl();
+        }
+      }
+      pickups = pickups.filter(p => !p.taken && p.x > -30);
+
+      const touching = hits();
+      if (shield > 0) {
+        // Shielded: mines, jellyfish and sharks get smashed; rocks and ice are passed straight through
+        for (const o of touching) {
+          if (o.type === 'rock' || o.type === 'ice') continue;
+          const cx = o.x + o.w / 2, cy = o.type === 'mine' ? mineY(o) : o.y;
+          for (let i = 0; i < 14; i++) spark(cx, cy);
+          obstacles.splice(obstacles.indexOf(o), 1);
+          shake = Math.max(shake, 0.15);
+          sfx.smash();
+        }
+        shield -= dt;
+        // never let the shield run out while the sub is still inside a rock or iceberg
+        if (shield <= 0) shield = hits().length ? 0.05 : 0;
+      } else if (touching.length) crash();
     } else if (state === 'title') {
       player.y = H / 2 + Math.sin(time * 1.5) * 12;
       player.angle = Math.cos(time * 1.5) * 0.08;
@@ -629,6 +698,44 @@
     ctx.stroke();
   }
 
+  function drawPearl(p) {
+    ctx.save();
+    ctx.shadowColor = 'rgba(200,240,255,0.95)';
+    ctx.shadowBlur = 12 + Math.sin(p.t * 5) * 4;
+    const g = ctx.createRadialGradient(p.x - 3, p.y - 3, 1, p.x, p.y, PEARL_R);
+    g.addColorStop(0, '#ffffff');
+    g.addColorStop(0.6, '#f1e9ff');
+    g.addColorStop(1, '#b9d8ec');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, PEARL_R, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+    ctx.fillStyle = `rgba(255,255,255,${0.5 + 0.5 * Math.sin(p.t * 6)})`; // twinkle
+    ctx.beginPath();
+    ctx.arc(p.x - 3, p.y - 3, 2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // rainbow bubble around the sub while a pearl is active; blinks when it's about to run out
+  function drawShield() {
+    if (shield <= 0 || (shield < 0.75 && Math.floor(shield * 10) % 2 === 0)) return;
+    const hue = (time * 360) % 360;
+    ctx.save();
+    ctx.translate(player.x, player.y);
+    ctx.rotate(player.angle);
+    ctx.shadowColor = `hsla(${hue},100%,65%,0.9)`;
+    ctx.shadowBlur = 18;
+    ctx.strokeStyle = `hsla(${hue},100%,70%,0.9)`;
+    ctx.lineWidth = 3;
+    ctx.fillStyle = `hsla(${(hue + 60) % 360},100%,75%,0.15)`;
+    ctx.beginPath();
+    ctx.ellipse(0, -4, 48, 32, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+  }
+
   function drawSub() {
     ctx.save();
     ctx.translate(player.x, player.y);
@@ -729,7 +836,14 @@
     const blinkOff = flash > 0 && Math.floor(flash * 6) % 2 === 0;
     ctx.fillText(blinkOff ? `HI ${pad(best)}       ` : `HI ${pad(best)}  ${pad(score)}`, W - 16, 30);
     ctx.textAlign = 'left';
-    ctx.fillText(state === 'title' ? LEVELS[level].label : `${LEVELS[level].label}  ${Math.round(speed / 10)} KN`, 16, 30);
+    ctx.fillText(state === 'title' ? LEVELS[level].label
+      : `${LEVELS[level].label}  ${Math.round(speed / 10)} KN  PEARLS ${pearls}`, 16, 30);
+    if (shield > 0) { // time left on the shield
+      ctx.fillStyle = 'rgba(255,255,255,0.25)';
+      ctx.fillRect(16, 40, 120, 6);
+      ctx.fillStyle = `hsl(${(time * 360) % 360},100%,70%)`;
+      ctx.fillRect(16, 40, 120 * clamp(shield / SHIELD_TIME, 0, 1), 6);
+    }
     if (muted) {
       ctx.textAlign = 'center';
       ctx.fillText('MUTED', W / 2, 30);
@@ -760,16 +874,19 @@
       else if (o.type === 'jelly') drawJelly(o);
       else if (o.type === 'shark') drawShark(o);
     }
+    for (const p of pickups) drawPearl(p);
     drawSub();
+    drawShield();
     drawParticles();
     ctx.restore();
 
     drawHUD();
     if (state === 'title') {
       drawPanel('SUB DASH', IS_TOUCH
-        ? ['Top half: rise  ·  Bottom half: dive', 'Tap to dive in', `Difficulty: ${LEVELS[level].label}`]
-        : ['Hold SPACE to rise, DOWN to dive', 'Press SPACE / click to dive in',
-          `Difficulty: ${LEVELS[level].label}  (keys 1 2 3)`]);
+        ? ['Top half: rise  ·  Bottom half: dive', 'Grab pearls, tap USE PEARL for a shield',
+          `Tap to dive in  ·  ${LEVELS[level].label}`]
+        : ['Hold SPACE to rise, DOWN to dive', 'Grab pearls, press E for a shield',
+          `SPACE / click to dive in  ·  ${LEVELS[level].label} (1 2 3)`]);
     } else if (state === 'over') {
       drawPanel('HULL BREACH!', [`Score ${score}   Best ${best}  (${LEVELS[level].label})`,
         time - overAt > 0.6 ? (IS_TOUCH ? 'Tap to try again' : 'Press SPACE / click to try again') : '']);
@@ -812,6 +929,19 @@
   levelsEl.addEventListener('click', e => { const b = e.target.closest('button'); if (b) setLevel(b.dataset.level); });
   updateLevelUI();
 
+  // Pearl button under the game (used by pointerdown below). Refreshed every frame, only touched when it changes.
+  const pearlBtn = document.getElementById('pearlBtn');
+  let pearlUI = '';
+  function updatePearlUI() {
+    const active = shield > 0 && state === 'playing';
+    const ui = `${pearls}|${active}|${state}|${paused}`;
+    if (ui === pearlUI) return;
+    pearlUI = ui;
+    pearlBtn.textContent = active ? 'Shield up!' : `Use pearl (${pearls})${IS_TOUCH ? '' : ' [E]'}`;
+    pearlBtn.classList.toggle('active', active);
+    pearlBtn.disabled = !active && (state !== 'playing' || paused || pearls === 0);
+  }
+
   window.addEventListener('keydown', e => {
     if (UP_KEYS.includes(e.code)) {
       e.preventDefault();
@@ -824,6 +954,8 @@
       syncInput();
     } else if (LEVEL_KEYS[e.code]) {
       setLevel(LEVEL_KEYS[e.code]);
+    } else if (e.code === 'KeyE') {
+      if (!e.repeat) usePearl();
     } else if (e.code === 'KeyP' && state === 'playing') {
       paused = !paused;
     } else if (e.code === 'KeyM') {
@@ -843,6 +975,11 @@
     if (levelBtn) { // picking a difficulty shouldn't also start the game
       e.preventDefault();
       setLevel(levelBtn.dataset.level);
+      return;
+    }
+    if (e.target.closest('#pearlBtn')) { // using a pearl shouldn't also rise or dive
+      e.preventDefault();
+      usePearl();
       return;
     }
     e.preventDefault();
@@ -872,6 +1009,7 @@
     last = now;
     if (!paused) update(dt);
     draw();
+    updatePearlUI();
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);
