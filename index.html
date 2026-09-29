@@ -7,7 +7,10 @@
 <style>
   html, body { margin: 0; height: 100%; background: #061a2b; color: #cfe9ff;
     font-family: system-ui, "Segoe UI", sans-serif; }
-  body { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; }
+  body { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px;
+    /* stop taps and long-presses from selecting text or popping up the copy menu on phones */
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent; touch-action: none; }
   h1 { margin: 0; font-size: 1.4rem; letter-spacing: .2em; }
   canvas { width: min(960px, 96vw); aspect-ratio: 960 / 420; border-radius: 12px;
     box-shadow: 0 10px 40px #0008; touch-action: none; display: block; }
@@ -766,7 +769,16 @@
     if (UP_KEYS.includes(e.code)) input.up = false;
     if (DOWN_KEYS.includes(e.code)) input.down = false;
   });
-  canvas.addEventListener('pointerdown', e => { e.preventDefault(); press(); });
+  // A press anywhere on the page counts, not just on the game window
+  window.addEventListener('pointerdown', e => {
+    if (e.button !== 0) return; // left mouse button / finger / pen only
+    e.preventDefault();
+    press();
+  });
+  // Holding a finger down counts as a long-press on phones; don't open the menu or start a selection
+  document.addEventListener('contextmenu', e => e.preventDefault());
+  document.addEventListener('touchstart', e => e.preventDefault(), { passive: false });
+  document.addEventListener('selectstart', e => e.preventDefault());
   window.addEventListener('pointerup', () => { input.up = false; });
   window.addEventListener('pointercancel', () => { input.up = false; });
   window.addEventListener('blur', () => {
