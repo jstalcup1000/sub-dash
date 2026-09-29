@@ -16,14 +16,24 @@
     box-shadow: 0 10px 40px #0008; touch-action: none; display: block; }
   .help { margin: 0; font-size: .9rem; opacity: .75; text-align: center; padding: 0 12px; }
   kbd { background: #123a55; border-radius: 4px; padding: 1px 6px; font-family: inherit; }
+  /* show keyboard help on computers, touch help on phones/tablets */
+  .help-touch { display: none; }
+  @media (pointer: coarse) {
+    .help-keys { display: none; }
+    .help-touch { display: block; }
+  }
 </style>
 </head>
 <body>
 <h1>SUB DASH</h1>
 <canvas id="game"></canvas>
-<p class="help">
-  Hold <kbd>Space</kbd> / <kbd>↑</kbd> / tap to blow ballast and rise &middot; release to sink &middot;
+<p class="help help-keys">
+  Hold <kbd>Space</kbd> / <kbd>↑</kbd> / click to blow ballast and rise &middot; release to sink &middot;
   <kbd>↓</kbd> dive &middot; <kbd>P</kbd> pause &middot; <kbd>M</kbd> mute
+</p>
+<p class="help help-touch">
+  Hold the <b>top half</b> of the screen to rise &middot; hold the <b>bottom half</b> to dive &middot;
+  let go to sink
 </p>
 
 <script>
@@ -64,7 +74,8 @@
   let obstacles = [], particles = [];
   let nextSpawn = 0, time = 0, overAt = 0, flash = 0, shake = 0, bgOffset = 0;
   const player = { x: 170, y: H / 2, vy: 0, angle: 0, prop: 0, bubbleTimer: 0 };
-  const input = { up: false, down: false };
+  const input = { up: false, down: false };   // combined keyboard + touch state, see Input below
+  const IS_TOUCH = window.matchMedia('(pointer: coarse)').matches;
 
   // ambient "marine snow"
   const snow = Array.from({ length: 70 }, () => ({
@@ -733,21 +744,31 @@
 
     drawHUD();
     if (state === 'title') {
-      drawPanel('SUB DASH', ['Hold SPACE or tap to rise', 'Press SPACE / tap to dive in']);
+      drawPanel('SUB DASH', IS_TOUCH
+        ? ['Top half: rise  ·  Bottom half: dive', 'Tap to dive in']
+        : ['Hold SPACE to rise, DOWN to dive', 'Press SPACE / click to dive in']);
     } else if (state === 'over') {
       drawPanel('HULL BREACH!', [`Score ${score}   Best ${best}`,
-        time - overAt > 0.6 ? 'Press SPACE / tap to try again' : '']);
+        time - overAt > 0.6 ? (IS_TOUCH ? 'Tap to try again' : 'Press SPACE / click to try again') : '']);
     } else if (paused) {
       drawPanel('PAUSED', ['Press P to resume']);
     }
   }
 
   // ---------- Input ----------
+  // Keyboard and pointers (mouse/fingers) are tracked separately, then combined into `input`.
+  // On touch screens the top half of the screen rises and the bottom half dives.
+  const keys = { up: false, down: false };
+  const pointers = new Map(); // pointerId -> 'up' | 'down'
+  function syncInput() {
+    const held = [...pointers.values()];
+    input.up = keys.up || held.includes('up');
+    input.down = keys.down || held.includes('down');
+  }
   function press() {
     sfx.init();
     if (state === 'title' || (state === 'over' && time - overAt > 0.6)) startGame();
     if (paused) paused = false;
-    input.up = true;
   }
   const UP_KEYS = ['Space', 'ArrowUp', 'KeyW'], DOWN_KEYS = ['ArrowDown', 'KeyS'];
 
@@ -755,9 +776,12 @@
     if (UP_KEYS.includes(e.code)) {
       e.preventDefault();
       if (!e.repeat) press();
+      keys.up = true;
+      syncInput();
     } else if (DOWN_KEYS.includes(e.code)) {
       e.preventDefault();
-      input.down = true;
+      keys.down = true;
+      syncInput();
     } else if (e.code === 'KeyP' && state === 'playing') {
       paused = !paused;
     } else if (e.code === 'KeyM') {
@@ -766,23 +790,30 @@
     }
   });
   window.addEventListener('keyup', e => {
-    if (UP_KEYS.includes(e.code)) input.up = false;
-    if (DOWN_KEYS.includes(e.code)) input.down = false;
+    if (UP_KEYS.includes(e.code)) keys.up = false;
+    if (DOWN_KEYS.includes(e.code)) keys.down = false;
+    syncInput();
   });
   // A press anywhere on the page counts, not just on the game window
   window.addEventListener('pointerdown', e => {
     if (e.button !== 0) return; // left mouse button / finger / pen only
     e.preventDefault();
     press();
+    const rise = e.pointerType === 'mouse' || e.clientY < window.innerHeight / 2;
+    pointers.set(e.pointerId, rise ? 'up' : 'down');
+    syncInput();
   });
   // Holding a finger down counts as a long-press on phones; don't open the menu or start a selection
   document.addEventListener('contextmenu', e => e.preventDefault());
   document.addEventListener('touchstart', e => e.preventDefault(), { passive: false });
   document.addEventListener('selectstart', e => e.preventDefault());
-  window.addEventListener('pointerup', () => { input.up = false; });
-  window.addEventListener('pointercancel', () => { input.up = false; });
+  const release = e => { pointers.delete(e.pointerId); syncInput(); };
+  window.addEventListener('pointerup', release);
+  window.addEventListener('pointercancel', release);
   window.addEventListener('blur', () => {
-    input.up = input.down = false;
+    keys.up = keys.down = false;
+    pointers.clear();
+    syncInput();
     if (state === 'playing') paused = true;
   });
 
