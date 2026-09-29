@@ -14,6 +14,11 @@
   h1 { margin: 0; font-size: 1.4rem; letter-spacing: .2em; }
   canvas { width: min(960px, 96vw); aspect-ratio: 960 / 420; border-radius: 12px;
     box-shadow: 0 10px 40px #0008; touch-action: none; display: block; }
+  .levels { display: flex; gap: 8px; align-items: center; font-size: .9rem; }
+  .levels button { background: #123a55; color: #cfe9ff; border: 1px solid #1f5b82; border-radius: 6px;
+    padding: 6px 14px; font: inherit; cursor: pointer; }
+  .levels button.active { background: #ffc300; color: #061a2b; border-color: #ffc300; font-weight: bold; }
+  .levels.locked { opacity: .45; pointer-events: none; } /* can't change difficulty mid-run */
   .help { margin: 0; font-size: .9rem; opacity: .75; text-align: center; padding: 0 12px; }
   kbd { background: #123a55; border-radius: 4px; padding: 1px 6px; font-family: inherit; }
   /* show keyboard help on computers, touch help on phones/tablets */
@@ -27,6 +32,12 @@
 <body>
 <h1>SUB DASH</h1>
 <canvas id="game"></canvas>
+<div class="levels" id="levels">
+  <span>Difficulty:</span>
+  <button type="button" data-level="easy">Easy</button>
+  <button type="button" data-level="normal">Normal</button>
+  <button type="button" data-level="hard">Hard</button>
+</div>
 <p class="help help-keys">
   Hold <kbd>Space</kbd> / <kbd>↑</kbd> / click to blow ballast and rise &middot; release to sink &middot;
   <kbd>↓</kbd> dive &middot; <kbd>P</kbd> pause &middot; <kbd>M</kbd> mute
@@ -52,7 +63,15 @@
   ctx.scale(dpr, dpr);
 
   // ---------- Tuning ----------
-  const START_SPEED = 280, MAX_SPEED = 720, ACCEL = 9;   // scroll speed, px/s
+  const START_SPEED = 280, ACCEL = 9;   // scroll speed, px/s
+  // Difficulty sets the top speed. Obstacle spacing/mix reaches its hardest at FULL_DIFFICULTY_SPEED,
+  // so Easy never gets the densest obstacles and Hard keeps getting faster beyond that.
+  const FULL_DIFFICULTY_SPEED = 720;
+  const LEVELS = {
+    easy:   { label: 'EASY',   maxSpeed: 520 },
+    normal: { label: 'NORMAL', maxSpeed: 720 },
+    hard:   { label: 'HARD',   maxSpeed: 950 }
+  };
   const RISE = 1100, SINK = 520, DIVE = 950;             // vertical accel, px/s^2
   const DRAG = 2.2, MAX_VY = 340;
 
@@ -69,7 +88,10 @@
   let state = 'title';   // title | playing | over
   let paused = false;
   let muted = localStorage.getItem('subdash-muted') === '1';
-  let best = +localStorage.getItem('subdash-best') || 0;
+  let level = LEVELS[localStorage.getItem('subdash-level')] ? localStorage.getItem('subdash-level') : 'normal';
+  // each difficulty keeps its own best score ('subdash-best' is Normal, so earlier scores carry over)
+  const bestKey = () => level === 'normal' ? 'subdash-best' : `subdash-best-${level}`;
+  let best = +localStorage.getItem(bestKey()) || 0;
   let speed = START_SPEED, distance = 0, score = 0, lastMilestone = 0;
   let obstacles = [], particles = [];
   let nextSpawn = 0, time = 0, overAt = 0, flash = 0, shake = 0, bgOffset = 0;
@@ -93,7 +115,7 @@
       + 0.15 * Math.sin(r.k[1] * a + r.ph[1]) + 0.08 * Math.sin(r.k[2] * a + r.ph[2]));
   }
 
-  const difficulty = () => clamp((speed - START_SPEED) / (MAX_SPEED - START_SPEED), 0, 1);
+  const difficulty = () => clamp((speed - START_SPEED) / (FULL_DIFFICULTY_SPEED - START_SPEED), 0, 1);
   const depthTint = () => clamp(score / 1500, 0, 1) * 0.85; // ocean darkens the further you go
 
   // ---------- Sound (tiny WebAudio synth, no files needed) ----------
@@ -251,19 +273,21 @@
     player.y = H / 2; player.vy = 0; player.angle = 0;
     state = 'playing';
     paused = false;
+    updateLevelUI();
     sfx.start();
   }
 
   function crash() {
     state = 'over';
     overAt = time;
+    updateLevelUI();
     shake = 0.35;
     for (let i = 0; i < 22; i++) spark(player.x, player.y);
     for (let i = 0; i < 40; i++) bubble(player.x + rand(-20, 20), player.y + rand(-10, 10), rand(-80, 80), rand(-160, -20));
     sfx.crash();
     if (score > best) {
       best = score;
-      localStorage.setItem('subdash-best', best);
+      localStorage.setItem(bestKey(), best);
     }
   }
 
@@ -283,7 +307,7 @@
     }
 
     if (state === 'playing') {
-      speed = Math.min(MAX_SPEED, speed + ACCEL * dt);
+      speed = Math.min(LEVELS[level].maxSpeed, speed + ACCEL * dt);
       distance += speed * dt;
       score = Math.floor(distance / 25);
       if (Math.floor(score / 100) > lastMilestone) {
@@ -704,10 +728,8 @@
     ctx.textAlign = 'right';
     const blinkOff = flash > 0 && Math.floor(flash * 6) % 2 === 0;
     ctx.fillText(blinkOff ? `HI ${pad(best)}       ` : `HI ${pad(best)}  ${pad(score)}`, W - 16, 30);
-    if (state !== 'title') {
-      ctx.textAlign = 'left';
-      ctx.fillText(`${Math.round(speed / 10)} KN`, 16, 30);
-    }
+    ctx.textAlign = 'left';
+    ctx.fillText(state === 'title' ? LEVELS[level].label : `${LEVELS[level].label}  ${Math.round(speed / 10)} KN`, 16, 30);
     if (muted) {
       ctx.textAlign = 'center';
       ctx.fillText('MUTED', W / 2, 30);
@@ -745,10 +767,11 @@
     drawHUD();
     if (state === 'title') {
       drawPanel('SUB DASH', IS_TOUCH
-        ? ['Top half: rise  ·  Bottom half: dive', 'Tap to dive in']
-        : ['Hold SPACE to rise, DOWN to dive', 'Press SPACE / click to dive in']);
+        ? ['Top half: rise  ·  Bottom half: dive', 'Tap to dive in', `Difficulty: ${LEVELS[level].label}`]
+        : ['Hold SPACE to rise, DOWN to dive', 'Press SPACE / click to dive in',
+          `Difficulty: ${LEVELS[level].label}  (keys 1 2 3)`]);
     } else if (state === 'over') {
-      drawPanel('HULL BREACH!', [`Score ${score}   Best ${best}`,
+      drawPanel('HULL BREACH!', [`Score ${score}   Best ${best}  (${LEVELS[level].label})`,
         time - overAt > 0.6 ? (IS_TOUCH ? 'Tap to try again' : 'Press SPACE / click to try again') : '']);
     } else if (paused) {
       drawPanel('PAUSED', ['Press P to resume']);
@@ -771,6 +794,23 @@
     if (paused) paused = false;
   }
   const UP_KEYS = ['Space', 'ArrowUp', 'KeyW'], DOWN_KEYS = ['ArrowDown', 'KeyS'];
+  const LEVEL_KEYS = { Digit1: 'easy', Digit2: 'normal', Digit3: 'hard' };
+
+  // Difficulty picker: buttons under the game, or keys 1/2/3. Locked while a run is in progress.
+  const levelsEl = document.getElementById('levels');
+  function setLevel(name) {
+    if (state === 'playing' || !LEVELS[name]) return;
+    level = name;
+    localStorage.setItem('subdash-level', level);
+    best = +localStorage.getItem(bestKey()) || 0;
+    updateLevelUI();
+  }
+  function updateLevelUI() {
+    levelsEl.classList.toggle('locked', state === 'playing');
+    for (const b of levelsEl.querySelectorAll('button')) b.classList.toggle('active', b.dataset.level === level);
+  }
+  levelsEl.addEventListener('click', e => { const b = e.target.closest('button'); if (b) setLevel(b.dataset.level); });
+  updateLevelUI();
 
   window.addEventListener('keydown', e => {
     if (UP_KEYS.includes(e.code)) {
@@ -782,6 +822,8 @@
       e.preventDefault();
       keys.down = true;
       syncInput();
+    } else if (LEVEL_KEYS[e.code]) {
+      setLevel(LEVEL_KEYS[e.code]);
     } else if (e.code === 'KeyP' && state === 'playing') {
       paused = !paused;
     } else if (e.code === 'KeyM') {
@@ -797,6 +839,12 @@
   // A press anywhere on the page counts, not just on the game window
   window.addEventListener('pointerdown', e => {
     if (e.button !== 0) return; // left mouse button / finger / pen only
+    const levelBtn = e.target.closest('#levels button');
+    if (levelBtn) { // picking a difficulty shouldn't also start the game
+      e.preventDefault();
+      setLevel(levelBtn.dataset.level);
+      return;
+    }
     e.preventDefault();
     press();
     const rise = e.pointerType === 'mouse' || e.clientY < window.innerHeight / 2;
