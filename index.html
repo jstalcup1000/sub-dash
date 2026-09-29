@@ -1,0 +1,790 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sub Dash</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #061a2b; color: #cfe9ff;
+    font-family: system-ui, "Segoe UI", sans-serif; }
+  body { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; }
+  h1 { margin: 0; font-size: 1.4rem; letter-spacing: .2em; }
+  canvas { width: min(960px, 96vw); aspect-ratio: 960 / 420; border-radius: 12px;
+    box-shadow: 0 10px 40px #0008; touch-action: none; display: block; }
+  .help { margin: 0; font-size: .9rem; opacity: .75; text-align: center; padding: 0 12px; }
+  kbd { background: #123a55; border-radius: 4px; padding: 1px 6px; font-family: inherit; }
+</style>
+</head>
+<body>
+<h1>SUB DASH</h1>
+<canvas id="game"></canvas>
+<p class="help">
+  Hold <kbd>Space</kbd> / <kbd>↑</kbd> / tap to blow ballast and rise &middot; release to sink &middot;
+  <kbd>↓</kbd> dive &middot; <kbd>P</kbd> pause &middot; <kbd>M</kbd> mute
+</p>
+
+<script>
+(() => {
+  'use strict';
+
+  // ---------- Setup ----------
+  const W = 960, H = 420;
+  const SURFACE = 48;          // y of the water surface
+  const SEABED = H - 28;       // y of the sea floor
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = W * dpr;
+  canvas.height = H * dpr;
+  ctx.scale(dpr, dpr);
+
+  // ---------- Tuning ----------
+  const START_SPEED = 280, MAX_SPEED = 720, ACCEL = 9;   // scroll speed, px/s
+  const RISE = 1100, SINK = 520, DIVE = 950;             // vertical accel, px/s^2
+  const DRAG = 2.2, MAX_VY = 340;
+
+  // ---------- Helpers ----------
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const mix = (c1, c2, t, a = 1) =>
+    `rgba(${Math.round(lerp(c1[0], c2[0], t))},${Math.round(lerp(c1[1], c2[1], t))},${Math.round(lerp(c1[2], c2[2], t))},${a})`;
+  const pad = n => String(n).padStart(5, '0');
+  const wrap = (v, m) => ((v % m) + m) % m;
+
+  // ---------- State ----------
+  let state = 'title';   // title | playing | over
+  let paused = false;
+  let muted = localStorage.getItem('subdash-muted') === '1';
+  let best = +localStorage.getItem('subdash-best') || 0;
+  let speed = START_SPEED, distance = 0, score = 0, lastMilestone = 0;
+  let obstacles = [], particles = [];
+  let nextSpawn = 0, time = 0, overAt = 0, flash = 0, shake = 0, bgOffset = 0;
+  const player = { x: 170, y: H / 2, vy: 0, angle: 0, prop: 0, bubbleTimer: 0 };
+  const input = { up: false, down: false };
+
+  // ambient "marine snow"
+  const snow = Array.from({ length: 70 }, () => ({
+    x: rand(0, W), y: rand(SURFACE, SEABED), z: rand(0.2, 1), vy: rand(2, 8), r: rand(0.6, 1.8)
+  }));
+
+  // parallax ridges (integer frequencies so they tile seamlessly every W px)
+  const ridges = [
+    { base: SEABED - 50, amp: 80, par: 0.12, deep: [16, 62, 92], k: [2, 5, 9], ph: [rand(0, 6), rand(0, 6), rand(0, 6)] },
+    { base: SEABED - 12, amp: 50, par: 0.3, deep: [10, 44, 70], k: [3, 7, 13], ph: [rand(0, 6), rand(0, 6), rand(0, 6)] }
+  ];
+  function ridgeY(r, x) {
+    const a = 2 * Math.PI * x / W;
+    return r.base - r.amp * (0.55 + 0.25 * Math.sin(r.k[0] * a + r.ph[0])
+      + 0.15 * Math.sin(r.k[1] * a + r.ph[1]) + 0.08 * Math.sin(r.k[2] * a + r.ph[2]));
+  }
+
+  const difficulty = () => clamp((speed - START_SPEED) / (MAX_SPEED - START_SPEED), 0, 1);
+  const depthTint = () => clamp(score / 1500, 0, 1) * 0.85; // ocean darkens the further you go
+
+  // ---------- Sound (tiny WebAudio synth, no files needed) ----------
+  const sfx = {
+    ac: null,
+    init() {
+      if (!this.ac) {
+        try { this.ac = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { /* no audio */ }
+      }
+      if (this.ac && this.ac.state === 'suspended') this.ac.resume();
+    },
+    tone(f1, f2, dur, type = 'sine', vol = 0.12, delay = 0) {
+      if (muted || !this.ac) return;
+      const c = this.ac, t = c.currentTime + delay;
+      const o = c.createOscillator(), g = c.createGain();
+      o.type = type;
+      o.frequency.setValueAtTime(f1, t);
+      if (f2) o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+      g.gain.setValueAtTime(vol, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o.connect(g).connect(c.destination);
+      o.start(t);
+      o.stop(t + dur + 0.02);
+    },
+    ping() { this.tone(1400, 1300, 0.5, 'sine', 0.1); this.tone(1400, 1300, 0.4, 'sine', 0.035, 0.3); },
+    start() { this.tone(300, 600, 0.25, 'triangle', 0.1); },
+    crash() {
+      if (muted || !this.ac) return;
+      const c = this.ac, len = c.sampleRate * 0.8;
+      const buf = c.createBuffer(1, len, c.sampleRate), data = buf.getChannelData(0);
+      for (let i = 0; i < len; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / len);
+      const src = c.createBufferSource(), f = c.createBiquadFilter(), g = c.createGain();
+      src.buffer = buf; f.type = 'lowpass'; f.frequency.value = 700; g.gain.value = 0.35;
+      src.connect(f).connect(g).connect(c.destination);
+      src.start();
+      this.tone(140, 40, 0.7, 'sawtooth', 0.12);
+    }
+  };
+
+  // ---------- Obstacles ----------
+  // Jagged pinnacle outline, relative coords: x across 0..w, y is height (0..~h)
+  function jagged(w, h) {
+    const n = 7, pts = [[0, 0]];
+    for (let i = 1; i < n; i++) {
+      const t = i / n;
+      pts.push([t * w + rand(-4, 4), h * (0.35 + 0.65 * Math.sin(Math.PI * t)) * rand(0.97, 1.05)]);
+    }
+    pts.push([w, 0]);
+    return pts;
+  }
+
+  function makeRock(x, w, h) { return { type: 'rock', x, w, h, pts: jagged(w, h), t: 0, kelp: Math.random() < 0.6 }; }
+  function makeIce(x, w, h) { return { type: 'ice', x, w, h, pts: jagged(w, h), t: 0 }; }
+
+  function spawnObstacle() {
+    const d = difficulty();
+    const x = W + 40;
+    const pool = ['rock', 'rock', 'ice', 'mine', 'jelly'];
+    if (d > 0.15) pool.push('combo');
+    if (d > 0.3) pool.push('shark', 'mine', 'combo');
+
+    switch (pool[Math.floor(Math.random() * pool.length)]) {
+      case 'rock':
+        obstacles.push(makeRock(x, rand(50, 100), rand(60, lerp(130, 200, d))));
+        break;
+      case 'ice':
+        obstacles.push(makeIce(x, rand(70, 130), rand(50, lerp(110, 160, d))));
+        break;
+      case 'combo': { // rock + iceberg with a gap to thread
+        const gap = lerp(180, 135, d), w = rand(60, 90);
+        const center = rand(SURFACE + gap / 2 + 40, SEABED - gap / 2 - 40);
+        obstacles.push(makeRock(x, w, SEABED - (center + gap / 2)));
+        obstacles.push(makeIce(x + rand(-10, 10), w + 10, (center - gap / 2) - SURFACE));
+        break;
+      }
+      case 'mine':
+        obstacles.push({ type: 'mine', x, w: 32, r: 15, baseY: rand(SURFACE + 70, SEABED - 70), t: rand(0, 6) });
+        break;
+      case 'jelly':
+        obstacles.push({ type: 'jelly', x, w: 36, r: 16, baseY: rand(SURFACE + 80, SEABED - 90), t: rand(0, 6), y: 0 });
+        break;
+      case 'shark': // faster than the current; announced by a "!" at the screen edge
+        obstacles.push({ type: 'shark', x: x + 320, w: 84, y: rand(SURFACE + 50, SEABED - 50), extra: rand(90, 170), t: 0 });
+        break;
+    }
+  }
+
+  // Hitboxes are a bit smaller than the art, like the dino game: forgiving.
+  function hitShapes(o) {
+    switch (o.type) {
+      case 'rock':
+      case 'ice': {
+        const tiers = [[0.35, 0.88], [0.18, 0.66], [0.04, 0.38]];
+        return tiers.map(([m, f]) => {
+          const rh = o.h * f;
+          return { rect: [o.x + o.w * m, o.type === 'ice' ? SURFACE : SEABED - rh, o.w * (1 - 2 * m), rh] };
+        });
+      }
+      case 'mine': return [{ circle: [o.x + o.w / 2, mineY(o), o.r - 1] }];
+      case 'jelly': return [{ circle: [o.x + o.w / 2, o.y, o.r - 2] }];
+      case 'shark': {
+        const cx = o.x + o.w / 2;
+        return [{ circle: [cx - 18, o.y, 12] }, { circle: [cx + 10, o.y, 12] }];
+      }
+    }
+    return [];
+  }
+  const mineY = o => o.baseY + Math.sin(o.t * 1.5) * 4;
+
+  function playerCircles() {
+    const c = Math.cos(player.angle), s = Math.sin(player.angle);
+    return [
+      [player.x - 15 * c, player.y - 15 * s, 12],
+      [player.x + 15 * c, player.y + 15 * s, 12],
+      [player.x + 4 * c + 17 * s, player.y + 4 * s - 17 * c, 6] // conning tower
+    ];
+  }
+
+  function circleHitsRect(cx, cy, r, rx, ry, rw, rh) {
+    const nx = clamp(cx, rx, rx + rw), ny = clamp(cy, ry, ry + rh);
+    return (cx - nx) ** 2 + (cy - ny) ** 2 < r * r;
+  }
+  function collides() {
+    const pcs = playerCircles();
+    for (const o of obstacles) {
+      if (o.x > player.x + 60 || o.x + o.w < player.x - 60) continue;
+      for (const s of hitShapes(o)) {
+        for (const [px, py, pr] of pcs) {
+          if (s.rect && circleHitsRect(px, py, pr, ...s.rect)) return true;
+          if (s.circle) {
+            const [cx, cy, cr] = s.circle;
+            if ((px - cx) ** 2 + (py - cy) ** 2 < (pr + cr) ** 2) return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  // ---------- Particles ----------
+  function bubble(x, y, vx, vy, r = rand(1.5, 4), life = rand(0.8, 1.6)) {
+    particles.push({ kind: 'bubble', x, y, vx, vy, r, life, max: life, ph: rand(0, 6) });
+  }
+  function spark(x, y) {
+    const a = rand(0, Math.PI * 2), v = rand(60, 260), life = rand(0.3, 0.8);
+    particles.push({ kind: 'spark', x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, r: rand(2, 5), life, max: life,
+      color: Math.random() < 0.5 ? '255,170,40' : '255,230,120' });
+  }
+
+  // ---------- Game flow ----------
+  function startGame() {
+    speed = START_SPEED; distance = 0; score = 0; lastMilestone = 0; flash = 0;
+    obstacles = []; particles = [];
+    nextSpawn = 500;
+    player.y = H / 2; player.vy = 0; player.angle = 0;
+    state = 'playing';
+    paused = false;
+    sfx.start();
+  }
+
+  function crash() {
+    state = 'over';
+    overAt = time;
+    shake = 0.35;
+    for (let i = 0; i < 22; i++) spark(player.x, player.y);
+    for (let i = 0; i < 40; i++) bubble(player.x + rand(-20, 20), player.y + rand(-10, 10), rand(-80, 80), rand(-160, -20));
+    sfx.crash();
+    if (score > best) {
+      best = score;
+      localStorage.setItem('subdash-best', best);
+    }
+  }
+
+  // ---------- Update ----------
+  function update(dt) {
+    time += dt;
+    const scroll = state === 'playing' ? speed : state === 'title' ? 90 : 0;
+    bgOffset += scroll * dt;
+    shake = Math.max(0, shake - dt);
+    flash = Math.max(0, flash - dt);
+
+    for (const s of snow) {
+      s.x -= (scroll * s.z * 0.5 + 6) * dt;
+      s.y += s.vy * dt;
+      if (s.x < -5) { s.x = W + 5; s.y = rand(SURFACE, SEABED); }
+      if (s.y > SEABED) s.y = SURFACE + 5;
+    }
+
+    if (state === 'playing') {
+      speed = Math.min(MAX_SPEED, speed + ACCEL * dt);
+      distance += speed * dt;
+      score = Math.floor(distance / 25);
+      if (Math.floor(score / 100) > lastMilestone) {
+        lastMilestone = Math.floor(score / 100);
+        flash = 1.2;
+        sfx.ping();
+      }
+
+      // Buoyancy: hold to rise, release to sink, down to dive
+      let ay = input.up ? -RISE : SINK;
+      if (input.down && !input.up) ay = DIVE;
+      player.vy += ay * dt;
+      player.vy -= player.vy * DRAG * dt;
+      player.vy = clamp(player.vy, -MAX_VY, MAX_VY);
+      player.y += player.vy * dt;
+      const top = SURFACE + 22, bottom = SEABED - 14;
+      if (player.y < top) { player.y = top; player.vy = Math.max(0, player.vy); }
+      if (player.y > bottom) { player.y = bottom; player.vy = Math.min(0, player.vy); }
+      player.angle = clamp(player.vy / MAX_VY, -1, 1) * 0.3;
+      player.prop += dt * (input.up ? 40 : 22);
+
+      // prop wash bubbles
+      player.bubbleTimer -= dt;
+      if (player.bubbleTimer <= 0) {
+        player.bubbleTimer = input.up ? 0.03 : 0.09;
+        bubble(player.x - 40, player.y + rand(-4, 4), -speed * 0.3 + rand(-20, 20), rand(-30, 10));
+      }
+
+      if (distance >= nextSpawn) {
+        spawnObstacle();
+        const tMin = lerp(1.6, 1.05, difficulty());
+        nextSpawn = distance + speed * rand(tMin, tMin + 0.9);
+      }
+
+      for (const o of obstacles) {
+        o.x -= (speed + (o.extra || 0)) * dt;
+        o.t += dt;
+        if (o.type === 'jelly') o.y = o.baseY + Math.sin(o.t * 2) * 40;
+      }
+      obstacles = obstacles.filter(o => o.x + o.w > -60);
+
+      if (collides()) crash();
+    } else if (state === 'title') {
+      player.y = H / 2 + Math.sin(time * 1.5) * 12;
+      player.angle = Math.cos(time * 1.5) * 0.08;
+      player.prop += dt * 18;
+      if (Math.random() < dt * 8) bubble(player.x - 40, player.y, rand(-60, -20), rand(-30, 0));
+    } else if (state === 'over') {
+      // wreck settles to the bottom
+      player.y = Math.min(SEABED - 12, player.y + 45 * dt);
+      player.angle = lerp(player.angle, 0.35, dt * 2);
+      for (const o of obstacles) {
+        o.t += dt;
+        if (o.type === 'jelly') o.y = o.baseY + Math.sin(o.t * 2) * 40;
+      }
+      if (Math.random() < dt * 6) bubble(player.x + rand(-15, 15), player.y - 10, rand(-10, 10), rand(-60, -30));
+    }
+
+    for (const p of particles) {
+      p.life -= dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      if (p.kind === 'bubble') {
+        p.vy -= 60 * dt;           // bubbles accelerate upward
+        p.vx *= 1 - 1.5 * dt;
+        p.x += Math.sin(time * 6 + p.ph) * 0.3;
+        if (p.y < SURFACE) p.life = 0;
+      } else {
+        p.vx *= 1 - 3 * dt;
+        p.vy *= 1 - 3 * dt;
+      }
+    }
+    particles = particles.filter(p => p.life > 0);
+  }
+
+  // ---------- Drawing ----------
+  function drawBackground() {
+    const t = depthTint();
+    // water
+    const g = ctx.createLinearGradient(0, SURFACE, 0, H);
+    g.addColorStop(0, mix([70, 175, 215], [18, 55, 105], t));
+    g.addColorStop(1, mix([8, 42, 82], [2, 8, 26], t));
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    // sky above a wavy surface line
+    const sky = ctx.createLinearGradient(0, 0, 0, SURFACE);
+    sky.addColorStop(0, mix([150, 210, 255], [25, 25, 65], t));
+    sky.addColorStop(1, mix([215, 240, 255], [70, 60, 110], t));
+    ctx.fillStyle = sky;
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    for (let x = 0; x <= W; x += 8) ctx.lineTo(x, SURFACE + Math.sin(x * 0.03 + bgOffset * 0.02 + time * 2) * 3);
+    ctx.lineTo(W, 0);
+    ctx.closePath();
+    ctx.fill();
+
+    // light rays
+    for (let i = 0; i < 5; i++) {
+      const x0 = wrap(i * 230 - bgOffset * 0.05, W + 200) - 100;
+      ctx.fillStyle = `rgba(255,255,255,${(0.05 + 0.03 * Math.sin(time * 0.8 + i * 1.7)) * (1 - t)})`;
+      ctx.beginPath();
+      ctx.moveTo(x0, SURFACE);
+      ctx.lineTo(x0 + 45, SURFACE);
+      ctx.lineTo(x0 + 150, SEABED);
+      ctx.lineTo(x0 + 65, SEABED);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    // distant ridges
+    for (const r of ridges) {
+      const off = bgOffset * r.par;
+      ctx.fillStyle = mix(r.deep, [3, 10, 25], t);
+      ctx.beginPath();
+      ctx.moveTo(0, H);
+      for (let sx = 0; sx <= W; sx += 8) ctx.lineTo(sx, ridgeY(r, sx + off));
+      ctx.lineTo(W, H);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    // marine snow
+    ctx.fillStyle = `rgba(220,240,255,${0.35 + t * 0.2})`;
+    for (const s of snow) {
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // kelp on the sea floor
+    for (let i = 0; i < 7; i++) {
+      const kx = wrap(i * 173 + 40 - bgOffset, W + 100) - 50;
+      const kh = 40 + (i * 37) % 40;
+      ctx.strokeStyle = mix([40, 130, 70], [10, 50, 40], t);
+      ctx.lineWidth = 4;
+      ctx.lineCap = 'round';
+      for (let j = 0; j < 3; j++) {
+        const sway = Math.sin(time * 1.6 + i + j) * 10;
+        ctx.beginPath();
+        ctx.moveTo(kx + j * 7, SEABED + 2);
+        ctx.quadraticCurveTo(kx + j * 7 + sway, SEABED - kh * 0.6, kx + j * 7 + sway * 0.5, SEABED - kh + j * 8);
+        ctx.stroke();
+      }
+    }
+
+    // sand
+    ctx.fillStyle = mix([165, 145, 100], [45, 42, 45], t);
+    ctx.beginPath();
+    ctx.moveTo(0, H);
+    for (let x = 0; x <= W; x += 10) ctx.lineTo(x, SEABED + Math.sin((x + bgOffset) * 0.05) * 2);
+    ctx.lineTo(W, H);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = mix([130, 112, 75], [30, 28, 32], t);
+    for (let i = 0; i < 40; i++) {
+      const px = wrap(i * 137.5 - bgOffset, W);
+      ctx.beginPath();
+      ctx.ellipse(px, SEABED + 7 + (i * 53) % 16, 3 + (i % 3), 1.5, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function drawPinnacle(o, fromTop) {
+    const baseY = fromTop ? SURFACE : SEABED, dir = fromTop ? 1 : -1;
+    ctx.beginPath();
+    o.pts.forEach(([px, ph], i) => {
+      const x = o.x + px, y = baseY + dir * ph;
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    ctx.closePath();
+  }
+
+  function drawRock(o) {
+    const t = depthTint();
+    if (o.kelp) { // a strand of kelp growing on the rock
+      ctx.strokeStyle = mix([50, 150, 80], [15, 60, 45], t);
+      ctx.lineWidth = 3;
+      const kx = o.x + o.w * 0.7, sway = Math.sin(time * 2 + o.x * 0.01) * 8;
+      ctx.beginPath();
+      ctx.moveTo(kx, SEABED - o.h * 0.5);
+      ctx.quadraticCurveTo(kx + sway, SEABED - o.h * 0.8, kx + sway * 0.4, SEABED - o.h * 1.05);
+      ctx.stroke();
+    }
+    const g = ctx.createLinearGradient(o.x, SEABED - o.h, o.x + o.w, SEABED);
+    g.addColorStop(0, mix([120, 110, 105], [50, 50, 60], t));
+    g.addColorStop(1, mix([60, 55, 60], [20, 20, 30], t));
+    ctx.fillStyle = g;
+    drawPinnacle(o, false);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
+  function drawIce(o) {
+    // tip above the waterline
+    ctx.fillStyle = '#f4fbff';
+    ctx.beginPath();
+    ctx.moveTo(o.x + o.w * 0.15, SURFACE + 2);
+    ctx.lineTo(o.x + o.w * 0.45, SURFACE - 22);
+    ctx.lineTo(o.x + o.w * 0.6, SURFACE - 14);
+    ctx.lineTo(o.x + o.w * 0.85, SURFACE + 2);
+    ctx.fill();
+    const g = ctx.createLinearGradient(0, SURFACE, 0, SURFACE + o.h);
+    g.addColorStop(0, 'rgba(235,250,255,0.95)');
+    g.addColorStop(1, 'rgba(150,210,235,0.85)');
+    ctx.fillStyle = g;
+    drawPinnacle(o, true);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.8)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
+  function drawMine(o) {
+    const cx = o.x + o.w / 2, cy = mineY(o);
+    ctx.strokeStyle = 'rgba(40,40,40,0.8)';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.moveTo(cx, cy + o.r);
+    ctx.lineTo(cx, SEABED);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#333';
+    ctx.fillRect(cx - 9, SEABED - 6, 18, 8);
+    ctx.strokeStyle = '#222';
+    ctx.lineWidth = 3;
+    for (let i = 0; i < 8; i++) {
+      const a = i * Math.PI / 4;
+      ctx.beginPath();
+      ctx.moveTo(cx + Math.cos(a) * o.r * 0.8, cy + Math.sin(a) * o.r * 0.8);
+      ctx.lineTo(cx + Math.cos(a) * (o.r + 6), cy + Math.sin(a) * (o.r + 6));
+      ctx.stroke();
+    }
+    const g = ctx.createRadialGradient(cx - 5, cy - 5, 2, cx, cy, o.r);
+    g.addColorStop(0, '#777');
+    g.addColorStop(1, '#1d1d1d');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(cx, cy, o.r, 0, Math.PI * 2);
+    ctx.fill();
+    if (Math.sin(time * 8) > 0) {
+      ctx.fillStyle = '#ff3b3b';
+      ctx.beginPath();
+      ctx.arc(cx, cy - o.r - 2, 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function drawJelly(o) {
+    const cx = o.x + o.w / 2, cy = o.y;
+    ctx.strokeStyle = 'rgba(255,170,220,0.6)';
+    ctx.lineWidth = 2;
+    for (let i = 0; i < 5; i++) {
+      const tx = cx - 11 + i * 5.5;
+      ctx.beginPath();
+      ctx.moveTo(tx, cy);
+      for (let k = 1; k <= 4; k++) ctx.lineTo(tx + Math.sin(time * 5 + i + k) * 3, cy + k * 7);
+      ctx.stroke();
+    }
+    ctx.save();
+    ctx.shadowColor = 'rgba(255,120,220,0.9)';
+    ctx.shadowBlur = 14;
+    ctx.fillStyle = 'rgba(255,130,210,0.75)';
+    const squish = 1 + Math.sin(o.t * 4) * 0.08;
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, o.r * squish, o.r / squish, 0, Math.PI, 0);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.beginPath();
+    ctx.ellipse(cx - 5, cy - 8, 4, 2.5, -0.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function drawShark(o) {
+    if (o.x > W) { // incoming warning
+      if (Math.sin(time * 14) > -0.2) {
+        ctx.fillStyle = '#ff4d4d';
+        ctx.font = 'bold 28px Consolas, monospace';
+        ctx.textAlign = 'right';
+        ctx.fillText('!', W - 12, o.y + 10);
+      }
+      return;
+    }
+    const cx = o.x + o.w / 2, cy = o.y, wag = Math.sin(o.t * 12) * 5;
+    ctx.fillStyle = '#6f8595';
+    ctx.beginPath(); // tail
+    ctx.moveTo(cx + 34, cy);
+    ctx.lineTo(cx + 54, cy - 16 + wag);
+    ctx.lineTo(cx + 50, cy + wag * 0.3);
+    ctx.lineTo(cx + 54, cy + 14 + wag);
+    ctx.closePath();
+    ctx.fill();
+    ctx.beginPath(); // dorsal fin
+    ctx.moveTo(cx - 6, cy - 11);
+    ctx.lineTo(cx + 6, cy - 28);
+    ctx.lineTo(cx + 14, cy - 10);
+    ctx.fill();
+    ctx.beginPath(); // body
+    ctx.ellipse(cx, cy, 40, 13, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#dfe7ec'; // belly
+    ctx.beginPath();
+    ctx.ellipse(cx - 4, cy + 5, 32, 6, 0, 0, Math.PI);
+    ctx.fill();
+    ctx.fillStyle = '#111';
+    ctx.beginPath();
+    ctx.arc(cx - 27, cy - 4, 2.2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#222';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(cx - 36, cy + 4);
+    ctx.lineTo(cx - 24, cy + 6);
+    ctx.stroke();
+  }
+
+  function drawSub() {
+    ctx.save();
+    ctx.translate(player.x, player.y);
+    ctx.rotate(player.angle);
+
+    // propeller
+    const blade = Math.abs(Math.sin(player.prop)) * 11 + 2;
+    ctx.fillStyle = '#556';
+    ctx.fillRect(-38, -2, 6, 4);
+    ctx.fillStyle = '#8a8f99';
+    ctx.beginPath();
+    ctx.ellipse(-40, 0, 2.5, blade, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // tail fins
+    ctx.fillStyle = '#d99a00';
+    ctx.beginPath();
+    ctx.moveTo(-24, -6); ctx.lineTo(-34, -15); ctx.lineTo(-30, -4); ctx.closePath(); ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(-24, 6); ctx.lineTo(-34, 15); ctx.lineTo(-30, 4); ctx.closePath(); ctx.fill();
+
+    // conning tower + periscope
+    ctx.strokeStyle = '#555';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(8, -20); ctx.lineTo(8, -30); ctx.lineTo(15, -30);
+    ctx.stroke();
+    ctx.fillStyle = '#e6ac00';
+    ctx.beginPath();
+    ctx.moveTo(-8, -9); ctx.lineTo(-4, -22); ctx.lineTo(14, -22); ctx.lineTo(16, -9);
+    ctx.closePath();
+    ctx.fill();
+
+    // hull
+    const g = ctx.createLinearGradient(0, -14, 0, 14);
+    g.addColorStop(0, '#ffe066');
+    g.addColorStop(0.55, '#ffc300');
+    g.addColorStop(1, '#c98f00');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 32, 14, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // portholes
+    for (const px of [-12, 0, 12]) {
+      ctx.fillStyle = '#9fe3ff';
+      ctx.beginPath();
+      ctx.arc(px, 0, 4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#8a6a00';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
+    // headlight glow as the ocean gets darker
+    const t = depthTint();
+    if (t > 0.2) {
+      const beam = ctx.createLinearGradient(32, 0, 200, 0);
+      beam.addColorStop(0, `rgba(255,250,200,${0.35 * t})`);
+      beam.addColorStop(1, 'rgba(255,250,200,0)');
+      ctx.fillStyle = beam;
+      ctx.beginPath();
+      ctx.moveTo(30, -3); ctx.lineTo(200, -45); ctx.lineTo(200, 45); ctx.lineTo(30, 3);
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawParticles() {
+    for (const p of particles) {
+      const a = clamp(p.life / p.max, 0, 1);
+      if (p.kind === 'bubble') {
+        ctx.strokeStyle = `rgba(225,245,255,${a * 0.8})`;
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+        ctx.stroke();
+      } else {
+        ctx.fillStyle = `rgba(${p.color},${a})`;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.r * a + 0.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  }
+
+  function drawHUD() {
+    ctx.font = 'bold 18px Consolas, "Courier New", monospace';
+    ctx.textBaseline = 'alphabetic';
+    ctx.shadowColor = 'rgba(0,0,0,0.5)';
+    ctx.shadowBlur = 4;
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'right';
+    const blinkOff = flash > 0 && Math.floor(flash * 6) % 2 === 0;
+    ctx.fillText(blinkOff ? `HI ${pad(best)}       ` : `HI ${pad(best)}  ${pad(score)}`, W - 16, 30);
+    if (state !== 'title') {
+      ctx.textAlign = 'left';
+      ctx.fillText(`${Math.round(speed / 10)} KN`, 16, 30);
+    }
+    if (muted) {
+      ctx.textAlign = 'center';
+      ctx.fillText('MUTED', W / 2, 30);
+    }
+    ctx.shadowBlur = 0;
+  }
+
+  function drawPanel(title, lines) {
+    ctx.fillStyle = 'rgba(3,20,35,0.6)';
+    ctx.fillRect(W / 2 - 230, H / 2 - 80, 460, 160);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ffd23f';
+    ctx.font = 'bold 40px Consolas, "Courier New", monospace';
+    ctx.fillText(title, W / 2, H / 2 - 25);
+    ctx.fillStyle = '#e8f6ff';
+    ctx.font = '17px Consolas, "Courier New", monospace';
+    lines.forEach((l, i) => ctx.fillText(l, W / 2, H / 2 + 15 + i * 26));
+  }
+
+  function draw() {
+    ctx.save();
+    if (shake > 0) ctx.translate(rand(-6, 6) * shake / 0.35, rand(-6, 6) * shake / 0.35);
+    drawBackground();
+    for (const o of obstacles) {
+      if (o.type === 'rock') drawRock(o);
+      else if (o.type === 'ice') drawIce(o);
+      else if (o.type === 'mine') drawMine(o);
+      else if (o.type === 'jelly') drawJelly(o);
+      else if (o.type === 'shark') drawShark(o);
+    }
+    drawSub();
+    drawParticles();
+    ctx.restore();
+
+    drawHUD();
+    if (state === 'title') {
+      drawPanel('SUB DASH', ['Hold SPACE or tap to rise', 'Press SPACE / tap to dive in']);
+    } else if (state === 'over') {
+      drawPanel('HULL BREACH!', [`Score ${score}   Best ${best}`,
+        time - overAt > 0.6 ? 'Press SPACE / tap to try again' : '']);
+    } else if (paused) {
+      drawPanel('PAUSED', ['Press P to resume']);
+    }
+  }
+
+  // ---------- Input ----------
+  function press() {
+    sfx.init();
+    if (state === 'title' || (state === 'over' && time - overAt > 0.6)) startGame();
+    if (paused) paused = false;
+    input.up = true;
+  }
+  const UP_KEYS = ['Space', 'ArrowUp', 'KeyW'], DOWN_KEYS = ['ArrowDown', 'KeyS'];
+
+  window.addEventListener('keydown', e => {
+    if (UP_KEYS.includes(e.code)) {
+      e.preventDefault();
+      if (!e.repeat) press();
+    } else if (DOWN_KEYS.includes(e.code)) {
+      e.preventDefault();
+      input.down = true;
+    } else if (e.code === 'KeyP' && state === 'playing') {
+      paused = !paused;
+    } else if (e.code === 'KeyM') {
+      muted = !muted;
+      localStorage.setItem('subdash-muted', muted ? '1' : '0');
+    }
+  });
+  window.addEventListener('keyup', e => {
+    if (UP_KEYS.includes(e.code)) input.up = false;
+    if (DOWN_KEYS.includes(e.code)) input.down = false;
+  });
+  canvas.addEventListener('pointerdown', e => { e.preventDefault(); press(); });
+  window.addEventListener('pointerup', () => { input.up = false; });
+  window.addEventListener('pointercancel', () => { input.up = false; });
+  window.addEventListener('blur', () => {
+    input.up = input.down = false;
+    if (state === 'playing') paused = true;
+  });
+
+  // ---------- Main loop ----------
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.033, (now - last) / 1000);
+    last = now;
+    if (!paused) update(dt);
+    draw();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
